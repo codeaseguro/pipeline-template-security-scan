@@ -38,12 +38,24 @@ runs:
         fi
 
     # upload-sarif sólo sube el reporte a la pestaña Security; no ejecuta análisis CodeQL.
+    # No es fatal: en repos privados sin GitHub Advanced Security, Code Scanning no está
+    # disponible y la subida falla. El escaneo y el gate tienen que correr igual.
     - name: Upload to GitHub Code Scanning
+      id: upload
       if: inputs.upload-sarif == 'true'
+      continue-on-error: true
       uses: github/codeql-action/upload-sarif@v4
       with:
         sarif_file: ${{ inputs.sarif-file }}
         category: ${{ inputs.category }}
+
+    - name: Warn if Code Scanning is unavailable
+      if: steps.upload.outcome == 'failure'
+      shell: bash
+      env:
+        CATEGORY: ${{ inputs.category }}
+      run: |
+        echo "::warning::$CATEGORY: no se pudo subir el SARIF a Code Scanning (¿repo privado sin GitHub Advanced Security?). Los resultados siguen en el resumen del job y en el artefacto. Usá upload-sarif: false para omitir este paso."
 
     - name: Upload SARIF artifact
       uses: actions/upload-artifact@v7
