@@ -1,0 +1,181 @@
+# Orquestador principal. Es el ÚNICO workflow que los proyectos consumidores deben llamar:
+#
+#   uses: codeaseguro/pipeline-template-security-scan/.github/workflows/security-scan.yml@v1
+#
+# Capas:
+#   1. detect          -> detecta lenguajes del repo (o usa el override `languages`)
+#   2. sast-common     -> Semgrep + Gitleaks + Trivy (agnóstico al lenguaje, siempre corre)
+#   3. sast-<lenguaje> -> herramientas específicas por lenguaje, sólo si el lenguaje existe
+#   4. security-gate   -> único check requerido para branch protection
+name: Security Scan (SAST)
+
+on:
+  workflow_call:
+    inputs:
+      languages:
+        description: 'Lenguajes separados por coma (javascript,java) o "auto".'
+        type: string
+        default: auto
+      fail-on-severity:
+        description: "Umbral que rompe el pipeline: none | critical | high | medium | low"
+        type: string
+        default: high
+      exclude-paths:
+        description: Directorios a excluir, separados por coma.
+        type: string
+        default: node_modules,vendor,dist,build,target,coverage,third_party
+      upload-sarif:
+        description: Subir resultados a GitHub Code Scanning (requiere GHAS en repos privados).
+        type: boolean
+        default: true
+      semgrep-config:
+        description: Rulesets de Semgrep separados por espacio. Si existe .semgrep/ en el repo se agrega.
+        type: string
+        default: p/default
+      java-version:
+        description: Versión de JDK para compilar proyectos Java (SpotBugs).
+        type: string
+        default: "21"
+      java-build-command:
+        description: Comando de compilación Java custom. Vacío = autodetectar Maven/Gradle.
+        type: string
+        default: ""
+      enable-spotbugs:
+        description: Compilar y analizar bytecode Java con SpotBugs + FindSecBugs.
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+jobs:
+  detect:
+    name: Detect languages
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      languages: ${{ steps.detect.outputs.languages }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Detect languages
+        id: detect
+        shell: bash
+        env:
+          INPUT_LANGUAGES: ${{ inputs.languages }}
+          EXCLUDE_PATHS: ${{ inputs.exclude-paths }}
+          FAIL_ON: ${{ inputs.fail-on-severity }}
+        run: |
+          set -euo pipefail
+
+          case "$FAIL_ON" in none|critical|high|medium|low) ;; *)
+            echo "::error::fail-on-severity inválido: '$FAIL_ON'"; exit 1 ;;
+          esac
+
+          # lenguaje -> regex sobre rutas de archivos versionados
+          declare -A PATTERNS=(
+            [javascript]='\.(js|jsx|mjs|cjs|ts|tsx)$|(^|/)package\.json$'
+            [java]='\.java$|(^|/)(pom\.xml|build\.gradle(\.kts)?)$'
+          )
+
+          langs=()
+          if [ "$INPUT_LANGUAGES" = "auto" ]; then
+            excl_re="(^|/)($(tr ',' '|' <<<"$EXCLUDE_PATHS" | sed 's/\./\\./g'))/"
+            files=$(git ls-files | grep -Ev "$excl_re" || true)
+            for lang in "${!PATTERNS[@]}"; do
+              if grep -Eq "${PATTERNS[$lang]}" <<<"$files"; then langs+=("$lang"); fi
+            done
+          else
+            IFS=',' read -ra requested <<<"$INPUT_LANGUAGES"
+            for raw in "${requested[@]}"; do
+              lang=$(tr -d '[:space:]' <<<"$raw" | tr '[:upper:]' '[:lower:]')
+              [ -z "$lang" ] && continue
+              if [ -z "${PATTERNS[$lang]+x}" ]; then
+                echo "::error::Lenguaje no soportado: '$lang'. Válidos: ${!PATTERNS[*]}"; exit 1
+              fi
+              langs+=("$lang")
+            done
+          fi
+
+          if [ "${#langs[@]}" -eq 0 ]; then
+            languages_json='[]'
+          else
+            languages_json=$(printf '%s\n' "${langs[@]}" | sort -u | jq -R . | jq -sc .)
+          fi
+
+          echo "languages=$languages_json" >> "$GITHUB_OUTPUT"
+          echo "### Lenguajes detectados: \`$languages_json\`" >> "$GITHUB_STEP_SUMMARY"
+
+  sast-common:
+    name: SAST common
+    needs: detect
+    permissions:
+      contents: read
+      security-events: write
+      actions: read
+    uses: codeaseguro/pipeline-template-security-scan/.github/workflows/sast-common.yml@v1
+    with:
+      fail-on-severity: ${{ inputs.fail-on-severity }}
+      exclude-paths: ${{ inputs.exclude-paths }}
+      upload-sarif: ${{ inputs.upload-sarif }}
+      semgrep-config: ${{ inputs.semgrep-config }}
+
+  sast-javascript:
+    name: SAST JavaScript/TypeScript
+    needs: detect
+    if: contains(fromJSON(needs.detect.outputs.languages), 'javascript')
+    permissions:
+      contents: read
+      security-events: write
+      actions: read
+    uses: codeaseguro/pipeline-template-security-scan/.github/workflows/sast-javascript.yml@v1
+    with:
+      fail-on-severity: ${{ inputs.fail-on-severity }}
+      exclude-paths: ${{ inputs.exclude-paths }}
+      upload-sarif: ${{ inputs.upload-sarif }}
+
+  sast-java:
+    name: SAST Java
+    needs: detect
+    if: contains(fromJSON(needs.detect.outputs.languages), 'java')
+    permissions:
+      contents: read
+      security-events: write
+      actions: read
+    uses: codeaseguro/pipeline-template-security-scan/.github/workflows/sast-java.yml@v1
+    with:
+      fail-on-severity: ${{ inputs.fail-on-severity }}
+      exclude-paths: ${{ inputs.exclude-paths }}
+      upload-sarif: ${{ inputs.upload-sarif }}
+      java-version: ${{ inputs.java-version }}
+      java-build-command: ${{ inputs.java-build-command }}
+      enable-spotbugs: ${{ inputs.enable-spotbugs }}
+
+  security-gate:
+    name: Security gate
+    if: always()
+    needs: [detect, sast-common, sast-javascript, sast-java]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Evaluate results
+        shell: bash
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+        run: |
+          set -euo pipefail
+          {
+            echo "### Security gate"
+            echo "| Job | Resultado |"
+            echo "|---|---|"
+            jq -r 'to_entries[] | "| \(.key) | \(.value.result) |"' <<<"$NEEDS"
+          } >> "$GITHUB_STEP_SUMMARY"
+          # skipped = lenguaje no presente en el repo -> OK
+          failed=$(jq -r '[to_entries[] | select(.value.result == "failure" or .value.result == "cancelled") | .key] | join(", ")' <<<"$NEEDS")
+          if [ -n "$failed" ]; then
+            echo "::error::Fallaron los escaneos: $failed"
+            exit 1
+          fi
+          echo "Todos los escaneos pasaron."

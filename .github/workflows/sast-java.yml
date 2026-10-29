@@ -1,0 +1,223 @@
+# SAST específico de Java: vanilla, Spring Boot o Quarkus (Maven o Gradle, mono o multi-módulo).
+#   - semgrep-java: reglas Java + FindSecBugs portadas a Semgrep. No compila, corre siempre.
+#   - spotbugs    : SpotBugs + plugin FindSecBugs sobre el bytecode. Más profundo
+#                   (detectores de Spring MVC/Security, JAX-RS/Quarkus, JPA, crypto...).
+#                   Requiere que el proyecto compile.
+# Las dependencias vulnerables (pom.xml, gradle.lockfile) ya las cubre Trivy en sast-common.
+name: SAST - Java
+
+on:
+  workflow_call:
+    inputs:
+      fail-on-severity:
+        type: string
+        default: high
+      exclude-paths:
+        type: string
+        default: node_modules,vendor,dist,build,target,coverage,third_party
+      upload-sarif:
+        type: boolean
+        default: true
+      java-version:
+        type: string
+        default: "21"
+      java-build-command:
+        description: Comando de compilación custom. Vacío = autodetectar Maven/Gradle.
+        type: string
+        default: ""
+      enable-spotbugs:
+        type: boolean
+        default: true
+      semgrep-config:
+        type: string
+        default: p/java p/findsecbugs
+
+permissions:
+  contents: read
+
+env:
+  SEMGREP_VERSION: "1.179.0"
+  SPOTBUGS_VERSION: "4.10.4"
+  SPOTBUGS_SHA256: "72bc0d4edd686e462c0f71f42a049b27bf4da6708797ff7b2b56dd202714b4e5"
+  FINDSECBUGS_VERSION: "1.14.0"
+  FINDSECBUGS_SHA256: "6fa340344fa433ff46c2985dab1010e8bc739f9395c983594a5240095e92abc8"
+
+jobs:
+  semgrep-java:
+    name: Semgrep Java
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      security-events: write
+      actions: read
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Install Semgrep
+        run: pipx install "semgrep==${SEMGREP_VERSION}"
+
+      - name: Run Semgrep
+        shell: bash
+        env:
+          SEMGREP_CONFIG: ${{ inputs.semgrep-config }}
+          EXCLUDE_PATHS: ${{ inputs.exclude-paths }}
+        run: |
+          set -uo pipefail
+          args=(scan --metrics=off --sarif --output semgrep-java.sarif)
+          for c in $SEMGREP_CONFIG; do args+=(--config "$c"); done
+          IFS=',' read -ra excl <<<"$EXCLUDE_PATHS"
+          for e in "${excl[@]}"; do [ -n "$e" ] && args+=(--exclude "$e"); done
+          semgrep "${args[@]}" .
+
+      - uses: codeaseguro/pipeline-template-security-scan/.github/actions/sarif-report@v1
+        with:
+          sarif-file: semgrep-java.sarif
+          category: semgrep-java
+          fail-on-severity: ${{ inputs.fail-on-severity }}
+          upload-sarif: ${{ inputs.upload-sarif }}
+
+  spotbugs:
+    name: SpotBugs + FindSecBugs
+    if: inputs.enable-spotbugs
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      security-events: write
+      actions: read
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Detect build tool and framework
+        id: project
+        shell: bash
+        env:
+          BUILD_COMMAND: ${{ inputs.java-build-command }}
+        run: |
+          set -euo pipefail
+          if [ -n "$BUILD_COMMAND" ]; then
+            tool=custom; cache=""
+          elif [ -f pom.xml ]; then
+            tool=maven; cache=maven
+          elif [ -f build.gradle ] || [ -f build.gradle.kts ]; then
+            tool=gradle; cache=gradle
+          else
+            echo "::error::No se encontró pom.xml ni build.gradle en la raíz. Usá el input java-build-command."
+            exit 1
+          fi
+
+          build_files=$(git ls-files 'pom.xml' '**/pom.xml' 'build.gradle*' '**/build.gradle*')
+          framework=vanilla
+          # shellcheck disable=SC2086
+          if [ -n "$build_files" ] && grep -qE 'io\.quarkus' $build_files; then framework=quarkus
+          elif [ -n "$build_files" ] && grep -qE 'spring-boot' $build_files; then framework=spring-boot
+          fi
+
+          echo "tool=$tool" >> "$GITHUB_OUTPUT"
+          echo "cache=$cache" >> "$GITHUB_OUTPUT"
+          echo "### ☕ Java: build=\`$tool\` · framework=\`$framework\`" >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: ${{ inputs.java-version }}
+          cache: ${{ steps.project.outputs.cache }}
+
+      - name: Compile
+        shell: bash
+        env:
+          TOOL: ${{ steps.project.outputs.tool }}
+          BUILD_COMMAND: ${{ inputs.java-build-command }}
+        run: |
+          set -euo pipefail
+          case "$TOOL" in
+            custom) bash -c "$BUILD_COMMAND" ;;
+            maven)
+              mvn_cmd=mvn; [ -x ./mvnw ] && mvn_cmd=./mvnw
+              "$mvn_cmd" -B -ntp -DskipTests compile
+              # Classpath de dependencias por módulo: mejora la precisión de SpotBugs
+              "$mvn_cmd" -B -ntp -q dependency:build-classpath -Dmdep.outputFile=target/spotbugs-cp.txt || \
+                echo "::warning::No se pudo resolver el classpath de dependencias; SpotBugs analizará igual."
+              ;;
+            gradle)
+              gradle_cmd=gradle; [ -x ./gradlew ] && gradle_cmd=./gradlew
+              "$gradle_cmd" --no-daemon classes -x test
+              ;;
+          esac
+
+      - name: Install SpotBugs + FindSecBugs (checksum verificado)
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP"
+          curl -sSfL -o spotbugs.tgz \
+            "https://github.com/spotbugs/spotbugs/releases/download/${SPOTBUGS_VERSION}/spotbugs-${SPOTBUGS_VERSION}.tgz"
+          echo "${SPOTBUGS_SHA256}  spotbugs.tgz" | sha256sum -c -
+          tar -xzf spotbugs.tgz
+          curl -sSfL -o findsecbugs.jar \
+            "https://repo1.maven.org/maven2/com/h3xstream/findsecbugs/findsecbugs-plugin/${FINDSECBUGS_VERSION}/findsecbugs-plugin-${FINDSECBUGS_VERSION}.jar"
+          echo "${FINDSECBUGS_SHA256}  findsecbugs.jar" | sha256sum -c -
+
+      - name: Run SpotBugs
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Clases de producción (Maven: target/classes, Gradle: build/classes/{java,kotlin}/main)
+          mapfile -t class_dirs < <(find . -type d \( -path '*/target/classes' -o -path '*/build/classes/java/main' -o -path '*/build/classes/kotlin/main' \) -not -path '*/node_modules/*')
+          if [ "${#class_dirs[@]}" -eq 0 ]; then
+            echo "::error::No se encontraron clases compiladas. Revisá el paso Compile o definí java-build-command."
+            exit 1
+          fi
+          echo "Analizando: ${class_dirs[*]}"
+
+          # Fuentes para que el SARIF apunte a archivos .java del repo
+          src=$(find . -type d \( -path '*/src/main/java' -o -path '*/src/main/kotlin' \) -not -path '*/node_modules/*' | paste -sd: -)
+
+          aux=$(find . -name spotbugs-cp.txt -path '*/target/*' -exec cat {} + 2>/dev/null | tr '\n' ':' | tr -s ':')
+          args=(-textui -effort:max -low -pluginList "$RUNNER_TEMP/findsecbugs.jar" "-sarif=spotbugs.sarif")
+          [ -n "$aux" ] && args+=(-auxclasspath "$aux")
+          [ -n "$src" ] && args+=(-sourcepath "$src")
+          # Falsos positivos aceptados por el proyecto
+          for f in spotbugs-exclude.xml .spotbugs-exclude.xml; do [ -f "$f" ] && args+=(-exclude "$f"); done
+
+          "$RUNNER_TEMP/spotbugs-${SPOTBUGS_VERSION}/bin/spotbugs" "${args[@]}" "${class_dirs[@]}"
+
+      # SpotBugs no emite security-severity, usa rutas absolutas del runner y mezcla
+      # bugs de calidad. Normalizamos: sólo categoría SECURITY, prioridad -> severidad
+      # (error=9.0 critical, warning=7.5 high, note=3.0 low) y URIs relativas al repo.
+      - name: Normalize SARIF
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/normalize.jq" <<'JQ'
+          def sev: if . == "error" then 9.0 elif . == "warning" then 7.5 else 3.0 end;
+          .runs |= map(
+            (.originalUriBaseIds // {}) as $bases
+            | (.tool.driver.rules // []) as $rules
+            | .results |= map(
+                select((($rules[.ruleIndex // -1].properties.tags) // []) | index("SECURITY"))
+                | .locations |= map(
+                    .physicalLocation.artifactLocation |= (
+                      if (.uriBaseId // null) != null and $bases[.uriBaseId] != null then
+                        {uri: (($bases[.uriBaseId].uri | sub("^file:"; "") | ltrimstr($ws) | gsub("/\\./"; "/") | ltrimstr("/")) + .uri)}
+                      else . end)))
+            | ([.results[] | {key: .ruleId, value: ((.level // "warning") | sev)}]
+                | group_by(.key) | map({key: .[0].key, value: (map(.value) | max)}) | from_entries) as $max
+            | .tool.driver.rules |= map(
+                if $max[.id] != null then .properties = ((.properties // {}) + {"security-severity": ($max[.id] | tostring)}) else . end)
+            | del(.originalUriBaseIds)
+          )
+          JQ
+          jq --arg ws "$PWD" -f "$RUNNER_TEMP/normalize.jq" spotbugs.sarif > spotbugs-security.sarif
+
+      - uses: codeaseguro/pipeline-template-security-scan/.github/actions/sarif-report@v1
+        with:
+          sarif-file: spotbugs-security.sarif
+          category: spotbugs
+          fail-on-severity: ${{ inputs.fail-on-severity }}
+          upload-sarif: ${{ inputs.upload-sarif }}

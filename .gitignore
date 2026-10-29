@@ -1,0 +1,21 @@
+# Reportes generados al probar las herramientas en local
+*.sarif
+spotbugs-cp.txt
+
+# Proyectos de prueba y sus builds (Java, Node)
+target/
+build/
+node_modules/
+
+# Secretos locales (nunca commitear)
+.env
+.env.*
+*.pem
+*.key
+
+# Sistema operativo y editores
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp

@@ -1,0 +1,65 @@
+# SAST específico de JavaScript / TypeScript / Node.js (incluye .ts y .tsx).
+#   - Semgrep con packs de JS/TS: XSS, NoSQLi, RCE, prototype pollution, Express/React inseguro.
+#     p/nodejsscan contiene las reglas de njsscan.
+# Las dependencias vulnerables (package-lock, yarn.lock, pnpm-lock) ya las cubre Trivy en sast-common.
+name: SAST - JavaScript
+
+on:
+  workflow_call:
+    inputs:
+      fail-on-severity:
+        type: string
+        default: high
+      exclude-paths:
+        type: string
+        default: node_modules,vendor,dist,build,target,coverage,third_party
+      upload-sarif:
+        type: boolean
+        default: true
+      semgrep-config:
+        description: Rulesets JS/TS separados por espacio.
+        type: string
+        default: p/javascript p/typescript p/nodejsscan p/react
+
+permissions:
+  contents: read
+
+env:
+  SEMGREP_VERSION: "1.179.0"
+
+jobs:
+  semgrep-js:
+    name: Semgrep JS/TS
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      security-events: write
+      actions: read
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Install Semgrep
+        run: pipx install "semgrep==${SEMGREP_VERSION}"
+
+      - name: Run Semgrep
+        shell: bash
+        env:
+          SEMGREP_CONFIG: ${{ inputs.semgrep-config }}
+          EXCLUDE_PATHS: ${{ inputs.exclude-paths }}
+        run: |
+          set -uo pipefail
+          args=(scan --metrics=off --sarif --output semgrep-js.sarif)
+          for c in $SEMGREP_CONFIG; do args+=(--config "$c"); done
+          IFS=',' read -ra excl <<<"$EXCLUDE_PATHS"
+          for e in "${excl[@]}"; do [ -n "$e" ] && args+=(--exclude "$e"); done
+          semgrep "${args[@]}" .
+
+      - uses: codeaseguro/pipeline-template-security-scan/.github/actions/sarif-report@v1
+        with:
+          sarif-file: semgrep-js.sarif
+          category: semgrep-js
+          fail-on-severity: ${{ inputs.fail-on-severity }}
+          upload-sarif: ${{ inputs.upload-sarif }}

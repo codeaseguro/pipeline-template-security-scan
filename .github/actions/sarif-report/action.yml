@@ -1,0 +1,122 @@
+name: SARIF report & gate
+description: >
+  Sube un SARIF a GitHub Code Scanning (opcional), lo guarda como artefacto,
+  escribe un resumen en el job y rompe el job si hay hallazgos >= umbral.
+
+inputs:
+  sarif-file:
+    description: Ruta al archivo SARIF generado por la herramienta.
+    required: true
+  category:
+    description: Categoría única para Code Scanning y nombre del artefacto (ej. semgrep, spotbugs).
+    required: true
+  fail-on-severity:
+    description: "none | critical | high | medium | low"
+    required: false
+    default: high
+  upload-sarif:
+    description: "'true' para subir a Code Scanning (requiere GHAS en repos privados)."
+    required: false
+    default: "true"
+
+outputs:
+  findings:
+    description: Cantidad de hallazgos con severidad >= umbral.
+    value: ${{ steps.gate.outputs.findings }}
+
+runs:
+  using: composite
+  steps:
+    - name: Verify SARIF exists
+      shell: bash
+      env:
+        SARIF_FILE: ${{ inputs.sarif-file }}
+      run: |
+        if [ ! -s "$SARIF_FILE" ]; then
+          echo "::error::No se generó el SARIF '$SARIF_FILE'. La herramienta falló antes de reportar."
+          exit 1
+        fi
+
+    # upload-sarif sólo sube el reporte a la pestaña Security; no ejecuta análisis CodeQL.
+    - name: Upload to GitHub Code Scanning
+      if: inputs.upload-sarif == 'true'
+      uses: github/codeql-action/upload-sarif@v4
+      with:
+        sarif_file: ${{ inputs.sarif-file }}
+        category: ${{ inputs.category }}
+
+    - name: Upload SARIF artifact
+      uses: actions/upload-artifact@v7
+      with:
+        name: sarif-${{ inputs.category }}
+        path: ${{ inputs.sarif-file }}
+        retention-days: 30
+        if-no-files-found: error
+
+    - name: Severity gate
+      id: gate
+      shell: bash
+      env:
+        SARIF_FILE: ${{ inputs.sarif-file }}
+        CATEGORY: ${{ inputs.category }}
+        FAIL_ON: ${{ inputs.fail-on-severity }}
+      run: |
+        set -euo pipefail
+
+        # Umbral numérico estilo CVSS (mismo criterio que GitHub "security-severity").
+        case "$FAIL_ON" in
+          critical) min=9.0 ;;
+          high)     min=7.0 ;;
+          medium)   min=4.0 ;;
+          low)      min=0.1 ;;
+          none)     min=999 ;;
+          *) echo "::error::fail-on-severity inválido: '$FAIL_ON'"; exit 1 ;;
+        esac
+
+        # Severidad por resultado: usa properties.security-severity de la regla si existe
+        # (Trivy, SpotBugs normalizado...), si no, cae al nivel SARIF (error/warning/note).
+        jq_filter='
+          def from_level: if . == "error" then 8.0 elif . == "warning" then 5.0 elif . == "note" then 2.0 else 5.0 end;
+          [ .runs[]? as $run
+            | (($run.tool.driver.rules // [])
+                | map({key: .id, value: {sev: (.properties["security-severity"] // null), lvl: (.defaultConfiguration.level // null)}})
+                | from_entries) as $rules
+            | $run.results[]?
+            | ($rules[.ruleId // ""] // {}) as $r
+            | {
+                rule: (.ruleId // "unknown"),
+                file: (.locations[0].physicalLocation.artifactLocation.uri // "-"),
+                line: (.locations[0].physicalLocation.region.startLine // 0),
+                score: (if $r.sev != null then ($r.sev | tonumber) else ((.level // $r.lvl // "warning") | from_level) end)
+              }
+          ]'
+
+        all=$(jq -c "$jq_filter" "$SARIF_FILE")
+        total=$(jq 'length' <<<"$all")
+        blocking=$(jq --argjson min "$min" '[.[] | select(.score >= $min)]' <<<"$all")
+        count=$(jq 'length' <<<"$blocking")
+        echo "findings=$count" >> "$GITHUB_OUTPUT"
+
+        {
+          echo "### $CATEGORY"
+          echo ""
+          echo "| Total hallazgos | Bloqueantes (>= $FAIL_ON) |"
+          echo "|---|---|"
+          echo "| $total | $count |"
+          if [ "$count" -gt 0 ]; then
+            echo ""
+            echo "<details><summary>Top 25 bloqueantes</summary>"
+            echo ""
+            echo "| Score | Regla | Archivo |"
+            echo "|---|---|---|"
+            jq -r 'sort_by(-.score) | .[:25][] | "| \(.score) | `\(.rule)` | `\(.file):\(.line)` |"' <<<"$blocking"
+            echo ""
+            echo "</details>"
+          fi
+        } >> "$GITHUB_STEP_SUMMARY"
+
+        if [ "$count" -gt 0 ]; then
+          echo "::error::$CATEGORY encontró $count hallazgo(s) con severidad >= $FAIL_ON"
+          exit 1
+        fi
+        echo "$CATEGORY: $total hallazgos, ninguno >= $FAIL_ON"
